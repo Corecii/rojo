@@ -453,6 +453,10 @@ function App:checkSyncReminder()
 
 	self:findActiveServer()
 		:andThen(function(serverInfo, host, port)
+			if self.serveSession ~= nil or self.autoConnectRequest ~= nil then
+				-- Connected or found a trigger while the probe was in flight
+				return
+			end
 			self:sendSyncReminder(
 				`Project '{serverInfo.projectName}' is serving at {host}:{port}.\nWould you like to connect?`,
 				{ "Connect", "Dismiss" }
@@ -657,6 +661,13 @@ function App:onAutoConnectTrigger(raw: string?)
 	end
 
 	self.autoConnectRequest = request
+	-- Plugins can start before the place's trigger loads, so a reminder for
+	-- another server may already be showing. Its Connect would now use the
+	-- trigger's host and port.
+	if self.dismissSyncReminder then
+		self.dismissSyncReminder()
+		self.dismissSyncReminder = nil
+	end
 	self:runAutoConnect()
 end
 
