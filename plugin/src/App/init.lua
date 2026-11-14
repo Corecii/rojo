@@ -19,6 +19,7 @@ local strict = require(Plugin.strict)
 local Dictionary = require(Plugin.Dictionary)
 local ServeSession = require(Plugin.ServeSession)
 local ApiContext = require(Plugin.ApiContext)
+local AutoConnect = require(Plugin.AutoConnect)
 local PatchSet = require(Plugin.PatchSet)
 local PatchTree = require(Plugin.PatchTree)
 local preloadAssets = require(Plugin.preloadAssets)
@@ -47,6 +48,8 @@ local AppStatus = strict("AppStatus", {
 })
 
 local e = Roact.createElement
+
+local AUTO_CONNECT_RETRY_SECONDS = 5
 
 local App = Roact.Component:extend("App")
 
@@ -154,6 +157,8 @@ function App:init()
 				self:checkSyncReminder()
 			end
 		end)
+
+		self:startAutoConnect()
 	end
 
 	if self:isAutoConnectPlaytestServerAvailable() then
@@ -186,6 +191,7 @@ function App:willUnmount()
 	end
 
 	self:stopSyncReminderPolling()
+	self:stopAutoConnect()
 
 	self.autoConnectPlaytestServerListener()
 	self:clearRunningConnectionInfo()
@@ -438,8 +444,8 @@ function App:checkSyncReminder()
 		return
 	end
 
-	if self.serveSession ~= nil or not self:isSyncLockAvailable() then
-		-- Already syncing or cannot sync, no reason to remind
+	if self.serveSession ~= nil or not self:isSyncLockAvailable() or self.autoConnectRequest ~= nil then
+		-- Already syncing, cannot sync, or auto-connect will handle it, so no reason to remind
 		return
 	end
 
@@ -600,7 +606,129 @@ function App:useRunningConnectionInfo()
 	self.setPort(port)
 end
 
-function App:startSession()
+function App:startAutoConnect()
+	local key, keyError = AutoConnect.readKey(Rojo)
+	if keyError ~= nil then
+		Log.warn("Auto-connect is off: {}", keyError)
+	end
+	if key == nil then
+		return
+	end
+
+	self.autoConnectKey = key
+	self.autoConnectGeneration = 0
+	self.stopWatchingAutoConnect = AutoConnect.watch(function(raw)
+		self:onAutoConnectTrigger(raw)
+	end)
+end
+
+function App:stopAutoConnect()
+	if self.stopWatchingAutoConnect ~= nil then
+		self.stopWatchingAutoConnect()
+		self.stopWatchingAutoConnect = nil
+	end
+
+	self.autoConnectRequest = nil
+	if self.autoConnectThread ~= nil and coroutine.status(self.autoConnectThread) ~= "dead" then
+		task.cancel(self.autoConnectThread)
+	end
+	self.autoConnectThread = nil
+end
+
+function App:onAutoConnectTrigger(raw: string?)
+	self.autoConnectGeneration += 1
+	self.autoConnectRequest = nil
+	-- A new trigger undoes a manual disconnect or abort.
+	self.autoConnectPaused = false
+	self.autoConnectMismatchNotified = nil
+
+	if raw == nil then
+		return
+	end
+
+	local request, reason = AutoConnect.parse(raw, self.autoConnectKey)
+	if request == nil then
+		Log.warn("Ignoring RojoAutoConnect: {}", reason)
+		self:addNotification({
+			text = `Ignoring RojoAutoConnect: {reason}.`,
+			timeout = 10,
+		})
+		return
+	end
+
+	self.autoConnectRequest = request
+	self:runAutoConnect()
+end
+
+-- One loop at a time. It always reads the latest request, so a running loop
+-- picks up a changed trigger.
+function App:runAutoConnect()
+	if self.autoConnectThread ~= nil and coroutine.status(self.autoConnectThread) ~= "dead" then
+		return
+	end
+
+	self.autoConnectThread = task.spawn(function()
+		while true do
+			local request = self.autoConnectRequest
+			if request == nil then
+				break
+			end
+
+			local generation = self.autoConnectGeneration
+			if not self.autoConnectPaused and self.serveSession == nil and self:isSyncLockAvailable() then
+				self:attemptAutoConnect(request)
+			end
+
+			if not request.reconnect and generation == self.autoConnectGeneration then
+				break
+			end
+
+			task.wait(AUTO_CONNECT_RETRY_SECONDS)
+		end
+	end)
+end
+
+-- Yields. Connects only if a server answers with the requested project name.
+function App:attemptAutoConnect(request: AutoConnect.Request)
+	self.setHost(request.host)
+	self.setPort(request.port)
+
+	local ok, serverInfo = self:findActiveServer():await()
+	if not ok or self.autoConnectRequest ~= request then
+		-- No server yet, or the trigger changed while we waited
+		return
+	end
+
+	if serverInfo.projectName ~= request.projectName then
+		if self.autoConnectMismatchNotified ~= serverInfo.projectName then
+			self.autoConnectMismatchNotified = serverInfo.projectName
+			self:addNotification({
+				text = string.format(
+					"Not auto-connecting: %s:%s is serving '%s', but this place expects '%s'.",
+					request.host,
+					request.port,
+					serverInfo.projectName,
+					request.projectName
+				),
+				timeout = 10,
+			})
+		end
+		return
+	end
+
+	if self.serveSession ~= nil or self.autoConnectPaused then
+		return
+	end
+
+	Log.info("Auto-connecting to project '{}' at {}:{}", request.projectName, request.host, request.port)
+	self:startSession({ expectedProjectName = request.projectName })
+end
+
+-- `expectedProjectName` aborts the session before anything syncs if the server
+-- serves a different project.
+function App:startSession(options: { expectedProjectName: string? }?)
+	local expectedProjectName = if options then options.expectedProjectName else nil
+
 	local claimedLock, priorOwner = self:claimSyncLock()
 	if not claimedLock then
 		local msg = string.format("Could not sync because user '%s' is already syncing", tostring(priorOwner))
@@ -713,6 +841,11 @@ function App:startSession()
 
 			-- Details being present indicates that this
 			-- disconnection was from an error.
+			if details == nil then
+				-- The user disconnected: don't auto-connect again until the trigger changes.
+				self.autoConnectPaused = true
+			end
+
 			if details ~= nil then
 				Log.warn("Disconnected from an error: {}", details)
 
@@ -739,6 +872,15 @@ function App:startSession()
 	end)
 
 	serveSession:setConfirmCallback(function(instanceMap, patch, serverInfo)
+		if expectedProjectName ~= nil and serverInfo.projectName ~= expectedProjectName then
+			Log.warn(
+				"Aborting auto-connect: server is serving '{}', expected '{}'",
+				serverInfo.projectName,
+				expectedProjectName
+			)
+			return "Abort"
+		end
+
 		if PatchSet.isEmpty(patch) then
 			Log.trace("Accepting patch without confirmation because it is empty")
 			return "Accept"
@@ -821,7 +963,12 @@ function App:startSession()
 			timeout = 7,
 		})
 
-		return self.confirmationEvent:Wait()
+		local decision = self.confirmationEvent:Wait()
+		if decision == "Abort" and expectedProjectName ~= nil then
+			-- The user aborted an auto-connect: don't ask again until the trigger changes.
+			self.autoConnectPaused = true
+		end
+		return decision
 	end)
 
 	serveSession:start()
